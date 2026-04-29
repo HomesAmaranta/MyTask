@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""mytask - simple sequential local task scheduler.
+
+Usage:
+  mytask <script.sh> [args...] [-m "desc"]   submit a task (optional description)
+  mytask show [-d N|all]         list tasks (default: today; -d N: last N days)
+  mytask log <id>                print task log
+  mytask kill <id>               cancel pending or kill running task
+  mytask clear                   remove finished tasks from list (keep logs)
+  mytask stop-daemon             stop the background daemon
+  mytask --daemon                (internal) run the scheduler loop
+"""
+
+import sys
+import os
+import json
+import time
+import errno
+import signal
+import fcntl
+import shlex
+import subprocess
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(os.path.realpath(__file__)).parent / "data"
+TASKS_FILE = ROOT / "tasks.json"
+LOGS_DIR = ROOT / "logs"
+DAEMON_PID = ROOT / "daemon.pid"
+LOCK_FILE = ROOT / "tasks.lock"
+DAEMON_LOG = ROOT / "daemon.log"
+
+IDLE_EXIT_SECONDS = 300  # daemon exits after 5 min idle
+
+
+# ---------- storage ----------
+
+def init():
+    ROOT.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    if not TASKS_FILE.exists():
+        TASKS_FILE.write_text("[]")
+
+
+@contextmanager
+def locked():
+    init()
+    f = open(LOCK_FILE, "w")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+
+
+def load_tasks():
+    try:
+        return json.loads(TASKS_FILE.read_text() or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def save_tasks(tasks):
+    tmp = TASKS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(tasks, indent=2, ensure_ascii=False))
+    tmp.replace(TASKS_FILE)
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def next_id(tasks):
+    return max((t["id"] for t in tasks), default=0) + 1
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+# ---------- commands ----------
+
+def cmd_submit(argv):
+    # extract optional -m/--desc "description" from anywhere in argv
+    desc = ""
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-m", "--desc") and i + 1 < len(argv):
+            desc = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("-m="):
+            desc = a[3:]
+            i += 1
+            continue
+        if a.startswith("--desc="):
+            desc = a[7:]
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    if not rest:
+        print("mytask: missing script", file=sys.stderr)
+        sys.exit(1)
+    script = rest[0]
+    script_path = Path(script).expanduser()
+    if not script_path.exists():
+        print(f"mytask: {script}: no such file", file=sys.stderr)
+        sys.exit(1)
+    script_path = script_path.resolve()
+    extra = rest[1:]
+    cmd = ["bash", str(script_path), *extra]
+    today = datetime.now().strftime("%Y-%m-%d")
+    day_dir = LOGS_DIR / today
+    day_dir.mkdir(parents=True, exist_ok=True)
+    with locked():
+        tasks = load_tasks()
+        tid = next_id(tasks)
+        tasks.append({
+            "id": tid,
+            "cmd": cmd,
+            "script": str(script_path),
+            "desc": desc,
+            "cwd": os.getcwd(),
+            "status": "pending",
+            "submitted_at": now_iso(),
+            "started_at": None,
+            "finished_at": None,
+            "exit_code": None,
+            "pid": None,
+            "log": str(day_dir / f"{tid}.log"),
+        })
+        save_tasks(tasks)
+    msg = f"submitted task {tid}: {' '.join(shlex.quote(c) for c in cmd)}"
+    if desc:
+        msg += f"   # {desc}"
+    print(msg)
+    ensure_daemon()
+
+
+def cmd_show(argv):
+    # parse -d N (or -d all) — number of days to show, default 1 (today only)
+    days = 1
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-d" and i + 1 < len(argv):
+            v = argv[i + 1]
+            days = 0 if v == "all" else int(v)
+            i += 2
+            continue
+        if a.startswith("-d="):
+            v = a[3:]
+            days = 0 if v == "all" else int(v)
+            i += 1
+            continue
+        i += 1
+
+    tasks = load_tasks()
+    if not tasks:
+        print("(no tasks)")
+        return
+
+    # filter by submitted_at date
+    if days > 0:
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(days=days - 1)).date()
+        def in_range(t):
+            # always show pending/running regardless of date
+            if t["status"] in ("pending", "running"):
+                return True
+            try:
+                d = datetime.fromisoformat(t["submitted_at"]).date()
+                return d >= cutoff
+            except Exception:
+                return True
+        tasks = [t for t in tasks if in_range(t)]
+
+    daemon_status = "running" if daemon_alive() else "stopped"
+    print(f"daemon: {daemon_status}   showing: {'all' if days == 0 else f'last {days} day(s)'}   tasks: {len(tasks)}")
+    if not tasks:
+        return
+    fmt = "{:>4}  {:<10}  {:<19}  {:<19}  {:>5}  {:<20}  {}"
+    print(fmt.format("ID", "STATUS", "STARTED", "FINISHED", "EXIT", "DESC", "CMD"))
+    for t in tasks:
+        cmd = " ".join(shlex.quote(c) for c in t.get("cmd") or [t.get("script", "")])
+        if len(cmd) > 60:
+            cmd = cmd[:57] + "..."
+        desc = t.get("desc") or "-"
+        if len(desc) > 20:
+            desc = desc[:17] + "..."
+        print(fmt.format(
+            t["id"],
+            t["status"],
+            (t["started_at"] or "-")[:19],
+            (t["finished_at"] or "-")[:19],
+            "-" if t["exit_code"] is None else str(t["exit_code"]),
+            desc,
+            cmd,
+        ))
+
+
+def cmd_log(argv):
+    if not argv:
+        print("mytask: log requires a task id", file=sys.stderr)
+        sys.exit(1)
+    tid = int(argv[0])
+    tasks = load_tasks()
+    t = next((x for x in tasks if x["id"] == tid), None)
+    if not t:
+        print(f"mytask: no task with id {tid}", file=sys.stderr)
+        sys.exit(1)
+    log_path = Path(t["log"])
+    if not log_path.exists():
+        print(f"(no log yet for task {tid})")
+        return
+    with open(log_path) as f:
+        sys.stdout.write(f.read())
+
+
+def cmd_kill(argv):
+    if not argv:
+        print("mytask: kill requires a task id", file=sys.stderr)
+        sys.exit(1)
+    tid = int(argv[0])
+    with locked():
+        tasks = load_tasks()
+        t = next((x for x in tasks if x["id"] == tid), None)
+        if not t:
+            print(f"mytask: no task with id {tid}", file=sys.stderr)
+            sys.exit(1)
+        if t["status"] == "pending":
+            t["status"] = "cancelled"
+            t["finished_at"] = now_iso()
+            save_tasks(tasks)
+            print(f"task {tid}: cancelled (was pending)")
+            return
+        if t["status"] == "running" and t["pid"]:
+            try:
+                os.killpg(os.getpgid(t["pid"]), signal.SIGTERM)
+                print(f"task {tid}: sent SIGTERM to pgid {os.getpgid(t['pid'])}")
+            except ProcessLookupError:
+                t["status"] = "failed"
+                t["finished_at"] = now_iso()
+                t["exit_code"] = -1
+                save_tasks(tasks)
+                print(f"task {tid}: process already gone, marked failed")
+            return
+        print(f"task {tid}: status is {t['status']}, nothing to kill")
+
+
+def cmd_clear(_argv):
+    with locked():
+        tasks = load_tasks()
+        keep = [t for t in tasks if t["status"] in ("pending", "running")]
+        removed = len(tasks) - len(keep)
+        save_tasks(keep)
+    print(f"cleared {removed} finished task(s)")
+
+
+def cmd_stop_daemon(_argv):
+    if not DAEMON_PID.exists():
+        print("daemon not running")
+        return
+    try:
+        pid = int(DAEMON_PID.read_text().strip())
+    except (ValueError, FileNotFoundError):
+        print("daemon pid file invalid")
+        return
+    if not pid_alive(pid):
+        DAEMON_PID.unlink(missing_ok=True)
+        print("daemon not running")
+        return
+    os.kill(pid, signal.SIGTERM)
+    print(f"sent SIGTERM to daemon (pid {pid})")
+
+
+# ---------- daemon ----------
+
+def daemon_alive():
+    if not DAEMON_PID.exists():
+        return False
+    try:
+        return pid_alive(int(DAEMON_PID.read_text().strip()))
+    except (ValueError, FileNotFoundError):
+        return False
+
+
+def ensure_daemon():
+    if daemon_alive():
+        return
+    DAEMON_PID.unlink(missing_ok=True)
+    log_f = open(DAEMON_LOG, "a")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--daemon"],
+        stdin=subprocess.DEVNULL,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+    )
+    log_f.close()
+    # give it a moment to write its pid
+    for _ in range(20):
+        if daemon_alive():
+            return
+        time.sleep(0.1)
+
+
+_stop_requested = False
+
+
+def _handle_stop(signum, frame):
+    global _stop_requested
+    _stop_requested = True
+
+
+def run_daemon():
+    init()
+    # single-instance guard via the lock file (separate from queue lock)
+    guard_path = ROOT / "daemon.lock"
+    guard = open(guard_path, "w")
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return  # another daemon is running
+
+    DAEMON_PID.write_text(str(os.getpid()))
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+
+    # mark any task previously "running" as orphaned (daemon died mid-task)
+    with locked():
+        tasks = load_tasks()
+        changed = False
+        for t in tasks:
+            if t["status"] == "running":
+                if pid_alive(t.get("pid") or 0):
+                    # somehow still running; leave it but we lost the handle
+                    # mark orphaned so we don't try to wait on it
+                    t["status"] = "orphaned"
+                    t["finished_at"] = now_iso()
+                else:
+                    t["status"] = "failed"
+                    t["finished_at"] = now_iso()
+                    t["exit_code"] = t["exit_code"] if t["exit_code"] is not None else -1
+                changed = True
+        if changed:
+            save_tasks(tasks)
+
+    current = None  # dict: {id, proc, log_f}
+    last_active = time.time()
+
+    print(f"[{now_iso()}] daemon started pid={os.getpid()}", flush=True)
+
+    try:
+        while not _stop_requested:
+            # check current process
+            if current is not None:
+                ret = current["proc"].poll()
+                if ret is not None:
+                    current["log_f"].write(
+                        f"\n=== finished: {now_iso()} exit={ret} ===\n"
+                    )
+                    current["log_f"].close()
+                    with locked():
+                        tasks = load_tasks()
+                        for t in tasks:
+                            if t["id"] == current["id"]:
+                                if t["status"] == "running":
+                                    t["status"] = "done" if ret == 0 else "failed"
+                                t["exit_code"] = ret
+                                t["finished_at"] = now_iso()
+                        save_tasks(tasks)
+                    print(f"[{now_iso()}] task {current['id']} finished exit={ret}", flush=True)
+                    current = None
+                    last_active = time.time()
+
+            # pick next task
+            if current is None:
+                next_task = None
+                with locked():
+                    tasks = load_tasks()
+                    for t in tasks:
+                        if t["status"] == "pending":
+                            next_task = t
+                            break
+                    if next_task is not None:
+                        log_path = Path(next_task["log"])
+                        log_f = open(log_path, "w")
+                        log_f.write(f"=== task {next_task['id']} ===\n")
+                        if next_task.get("desc"):
+                            log_f.write(f"desc: {next_task['desc']}\n")
+                        log_f.write(f"cmd: {' '.join(shlex.quote(c) for c in next_task['cmd'])}\n")
+                        log_f.write(f"cwd: {next_task['cwd']}\n")
+                        log_f.write(f"submitted: {next_task['submitted_at']}\n")
+                        log_f.write(f"started:   {now_iso()}\n")
+                        log_f.write("=== output ===\n")
+                        log_f.flush()
+                        try:
+                            proc = subprocess.Popen(
+                                next_task["cmd"],
+                                cwd=next_task["cwd"] if os.path.isdir(next_task["cwd"]) else None,
+                                stdout=log_f,
+                                stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL,
+                                start_new_session=True,
+                            )
+                        except Exception as e:
+                            log_f.write(f"\n=== failed to start: {e} ===\n")
+                            log_f.close()
+                            for t in tasks:
+                                if t["id"] == next_task["id"]:
+                                    t["status"] = "failed"
+                                    t["finished_at"] = now_iso()
+                                    t["exit_code"] = -1
+                            save_tasks(tasks)
+                            next_task = None
+                        else:
+                            for t in tasks:
+                                if t["id"] == next_task["id"]:
+                                    t["status"] = "running"
+                                    t["pid"] = proc.pid
+                                    t["started_at"] = now_iso()
+                            save_tasks(tasks)
+                            current = {"id": next_task["id"], "proc": proc, "log_f": log_f}
+                            print(f"[{now_iso()}] task {next_task['id']} started pid={proc.pid}", flush=True)
+                            last_active = time.time()
+
+                # check for cancel-on-running: if user marked status != running, kill
+            if current is not None:
+                with locked():
+                    tasks = load_tasks()
+                    for t in tasks:
+                        if t["id"] == current["id"] and t["status"] == "cancelled":
+                            try:
+                                os.killpg(os.getpgid(current["proc"].pid), signal.SIGTERM)
+                            except ProcessLookupError:
+                                pass
+
+            # idle exit
+            if current is None and time.time() - last_active > IDLE_EXIT_SECONDS:
+                print(f"[{now_iso()}] idle, exiting", flush=True)
+                break
+
+            time.sleep(1)
+    finally:
+        # if we are stopping while a task runs, leave it running but record state
+        if current is not None:
+            ret = current["proc"].poll()
+            if ret is None:
+                # detach: leave task as running, daemon will pick up status on next run via orphan logic
+                current["log_f"].write(
+                    f"\n=== daemon stopping at {now_iso()}, task continues in background ===\n"
+                )
+            current["log_f"].close()
+        DAEMON_PID.unlink(missing_ok=True)
+        print(f"[{now_iso()}] daemon exit", flush=True)
+
+
+# ---------- entry ----------
+
+USAGE = __doc__
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(USAGE)
+        sys.exit(1)
+
+    cmd, rest = args[0], args[1:]
+
+    if cmd == "--daemon":
+        run_daemon()
+        return
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    if cmd == "show":
+        cmd_show(rest)
+        return
+    if cmd == "log":
+        cmd_log(rest)
+        return
+    if cmd == "kill":
+        cmd_kill(rest)
+        return
+    if cmd == "clear":
+        cmd_clear(rest)
+        return
+    if cmd == "stop-daemon":
+        cmd_stop_daemon(rest)
+        return
+
+    # default: submit
+    cmd_submit(args)
+
+
+if __name__ == "__main__":
+    main()

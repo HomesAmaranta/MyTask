@@ -7,7 +7,7 @@
 把脚本软链到 PATH 里任意目录，例如：
 
 ```bash
-ln -s /localdata/homes/ybfeng/project/mytask/mytask ~/miniconda3/envs/test_npm/bin/mytask
+ln -s /Path/to/MyTask/mytask ~/miniconda3/envs/test_npm/bin/mytask
 ```
 
 无第三方依赖，只要有 Python 3 即可。

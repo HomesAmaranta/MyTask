@@ -5,7 +5,7 @@ Usage:
   mytask <script.sh> [args...] [-m "desc"]   submit a task (optional description)
   mytask show [-d N|all]         list tasks (default: today; -d N: last N days)
   mytask log <id>                print task log
-  mytask kill <id>               cancel pending or kill running task
+  mytask kill <id|a-b>           cancel/kill a task or an inclusive id range
   mytask clear                   remove finished tasks from list (keep logs)
   mytask stop-daemon             stop the background daemon
   mytask --daemon                (internal) run the scheduler loop
@@ -19,6 +19,7 @@ import errno
 import signal
 import fcntl
 import shlex
+import shutil
 import subprocess
 from contextlib import contextmanager
 from datetime import datetime
@@ -27,6 +28,7 @@ from pathlib import Path
 ROOT = Path(os.path.realpath(__file__)).parent / "data"
 TASKS_FILE = ROOT / "tasks.json"
 LOGS_DIR = ROOT / "logs"
+SCRIPTS_DIR = ROOT / "scripts"
 DAEMON_PID = ROOT / "daemon.pid"
 LOCK_FILE = ROOT / "tasks.lock"
 DAEMON_LOG = ROOT / "daemon.log"
@@ -39,8 +41,20 @@ IDLE_EXIT_SECONDS = 300  # daemon exits after 5 min idle
 def init():
     ROOT.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     if not TASKS_FILE.exists():
         TASKS_FILE.write_text("[]")
+
+
+def cleanup_cached_script(t):
+    p = t.get("cached_script")
+    if p:
+        try:
+            Path(p).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 @contextmanager
@@ -121,17 +135,21 @@ def cmd_submit(argv):
         sys.exit(1)
     script_path = script_path.resolve()
     extra = rest[1:]
-    cmd = ["bash", str(script_path), *extra]
     today = datetime.now().strftime("%Y-%m-%d")
     day_dir = LOGS_DIR / today
     day_dir.mkdir(parents=True, exist_ok=True)
+    init()
     with locked():
         tasks = load_tasks()
         tid = next_id(tasks)
+        cached = SCRIPTS_DIR / f"{tid}{script_path.suffix or '.sh'}"
+        shutil.copy2(script_path, cached)
+        cmd = ["bash", str(cached), *extra]
         tasks.append({
             "id": tid,
             "cmd": cmd,
             "script": str(script_path),
+            "cached_script": str(cached),
             "desc": desc,
             "cwd": os.getcwd(),
             "status": "pending",
@@ -143,7 +161,9 @@ def cmd_submit(argv):
             "log": str(day_dir / f"{tid}.log"),
         })
         save_tasks(tasks)
-    msg = f"submitted task {tid}: {' '.join(shlex.quote(c) for c in cmd)}"
+    msg = f"submitted task {tid}: {script_path}"
+    if extra:
+        msg += " " + " ".join(shlex.quote(c) for c in extra)
     if desc:
         msg += f"   # {desc}"
     print(msg)
@@ -230,35 +250,56 @@ def cmd_log(argv):
         sys.stdout.write(f.read())
 
 
+def _parse_id_range(spec):
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        lo, hi = int(a), int(b)
+        if lo > hi:
+            lo, hi = hi, lo
+        return list(range(lo, hi + 1))
+    return [int(spec)]
+
+
 def cmd_kill(argv):
     if not argv:
-        print("mytask: kill requires a task id", file=sys.stderr)
+        print("mytask: kill requires a task id or range (e.g. 3 or 3-7)", file=sys.stderr)
         sys.exit(1)
-    tid = int(argv[0])
+    try:
+        tids = _parse_id_range(argv[0])
+    except ValueError:
+        print(f"mytask: invalid id/range '{argv[0]}'", file=sys.stderr)
+        sys.exit(1)
     with locked():
         tasks = load_tasks()
-        t = next((x for x in tasks if x["id"] == tid), None)
-        if not t:
-            print(f"mytask: no task with id {tid}", file=sys.stderr)
-            sys.exit(1)
-        if t["status"] == "pending":
-            t["status"] = "cancelled"
-            t["finished_at"] = now_iso()
-            save_tasks(tasks)
-            print(f"task {tid}: cancelled (was pending)")
-            return
-        if t["status"] == "running" and t["pid"]:
-            try:
-                os.killpg(os.getpgid(t["pid"]), signal.SIGTERM)
-                print(f"task {tid}: sent SIGTERM to pgid {os.getpgid(t['pid'])}")
-            except ProcessLookupError:
-                t["status"] = "failed"
+        by_id = {x["id"]: x for x in tasks}
+        changed = False
+        for tid in tids:
+            t = by_id.get(tid)
+            if not t:
+                print(f"task {tid}: no such task")
+                continue
+            if t["status"] == "pending":
+                t["status"] = "cancelled"
                 t["finished_at"] = now_iso()
-                t["exit_code"] = -1
-                save_tasks(tasks)
-                print(f"task {tid}: process already gone, marked failed")
-            return
-        print(f"task {tid}: status is {t['status']}, nothing to kill")
+                cleanup_cached_script(t)
+                changed = True
+                print(f"task {tid}: cancelled (was pending)")
+                continue
+            if t["status"] == "running" and t["pid"]:
+                try:
+                    pgid = os.getpgid(t["pid"])
+                    os.killpg(pgid, signal.SIGTERM)
+                    print(f"task {tid}: sent SIGTERM to pgid {pgid}")
+                except ProcessLookupError:
+                    t["status"] = "failed"
+                    t["finished_at"] = now_iso()
+                    t["exit_code"] = -1
+                    changed = True
+                    print(f"task {tid}: process already gone, marked failed")
+                continue
+            print(f"task {tid}: status is {t['status']}, nothing to kill")
+        if changed:
+            save_tasks(tasks)
 
 
 def cmd_clear(_argv):
@@ -356,6 +397,7 @@ def run_daemon():
                     t["status"] = "failed"
                     t["finished_at"] = now_iso()
                     t["exit_code"] = t["exit_code"] if t["exit_code"] is not None else -1
+                    cleanup_cached_script(t)
                 changed = True
         if changed:
             save_tasks(tasks)
@@ -383,6 +425,7 @@ def run_daemon():
                                     t["status"] = "done" if ret == 0 else "failed"
                                 t["exit_code"] = ret
                                 t["finished_at"] = now_iso()
+                                cleanup_cached_script(t)
                         save_tasks(tasks)
                     print(f"[{now_iso()}] task {current['id']} finished exit={ret}", flush=True)
                     current = None

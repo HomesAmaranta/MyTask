@@ -14,6 +14,7 @@ Usage:
 import sys
 import os
 import json
+import re
 import time
 import errno
 import signal
@@ -35,6 +36,8 @@ DAEMON_LOG = ROOT / "daemon.log"
 
 IDLE_EXIT_SECONDS = 300  # daemon exits after 5 min idle
 
+YAML_EXTS = (".yaml", ".yml")
+
 
 # ---------- storage ----------
 
@@ -55,6 +58,150 @@ def cleanup_cached_script(t):
             pass
         except OSError:
             pass
+    for p in t.get("cached_yamls") or []:
+        try:
+            Path(p).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    d = t.get("cached_yaml_dir")
+    if d:
+        try:
+            Path(d).rmdir()
+        except OSError:
+            pass
+
+
+def _looks_like_yaml_path(s):
+    return isinstance(s, str) and s.lower().endswith(YAML_EXTS)
+
+
+def snapshot_yamls(extra, tid):
+    """Replace yaml-looking paths in `extra` with copies under SCRIPTS_DIR/<tid>_yamls/.
+
+    Supports two forms:
+      - bare path:           ".../foo.yaml"
+      - key=path:            "--model_yaml=.../foo.yaml"
+    Returns (new_extra, cached_paths, cache_dir_or_None).
+    Files that don't exist on disk are left untouched.
+    """
+    new_extra = list(extra)
+    cached_paths = []
+    cache_dir = SCRIPTS_DIR / f"{tid}_yamls"
+    used = False
+
+    def _cache(src_path):
+        nonlocal used
+        if not used:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            used = True
+        # avoid name collisions across multiple yamls with same basename
+        dst = cache_dir / src_path.name
+        i = 1
+        while dst.exists():
+            dst = cache_dir / f"{src_path.stem}_{i}{src_path.suffix}"
+            i += 1
+        shutil.copy2(src_path, dst)
+        cached_paths.append(str(dst))
+        return str(dst)
+
+    for i, a in enumerate(new_extra):
+        if _looks_like_yaml_path(a):
+            p = Path(a).expanduser()
+            if p.is_file():
+                new_extra[i] = _cache(p.resolve())
+            continue
+        if "=" in a:
+            k, v = a.split("=", 1)
+            if _looks_like_yaml_path(v):
+                p = Path(v).expanduser()
+                if p.is_file():
+                    new_extra[i] = f"{k}={_cache(p.resolve())}"
+    return new_extra, cached_paths, (str(cache_dir) if used else None)
+
+
+# Match yaml/yml paths inside a shell script. We accept bare tokens, single-
+# or double-quoted strings, and key=value forms. The path itself can contain
+# letters, digits, dot, slash, dash, underscore, tilde, and $ (for env vars
+# we don't expand — only literal paths get rewritten).
+_YAML_TOKEN = re.compile(
+    r"""(?P<full>(?P<quote>["']?)(?P<path>[A-Za-z0-9_./~\-]+\.(?:yaml|yml))(?P=quote))""",
+    re.IGNORECASE,
+)
+
+
+def snapshot_yamls_in_script(cached_script_path, tid, script_cwd):
+    """Scan a (cached) shell script, replace literal *.yaml/.yml paths with
+    snapshot copies under SCRIPTS_DIR/<tid>_yamls/.
+
+    Resolution order for each match:
+      1. as-is (absolute, or relative to caller's cwd)
+      2. relative to the original script directory
+
+    Files that cannot be resolved are left untouched (assumed to be runtime-
+    constructed paths, env vars, or user-provided args).
+
+    Mutates the cached script in place. Returns (cached_paths, cache_dir_or_None).
+    """
+    text = Path(cached_script_path).read_text(encoding="utf-8", errors="replace")
+    cache_dir = SCRIPTS_DIR / f"{tid}_yamls"
+    cached_paths = []
+    used = False
+    seen = {}  # original_resolved_path -> cached_path
+
+    def _cache(src_path):
+        nonlocal used
+        key = str(src_path)
+        if key in seen:
+            return seen[key]
+        if not used:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            used = True
+        dst = cache_dir / src_path.name
+        i = 1
+        while dst.exists():
+            dst = cache_dir / f"{src_path.stem}_{i}{src_path.suffix}"
+            i += 1
+        shutil.copy2(src_path, dst)
+        cached_paths.append(str(dst))
+        seen[key] = str(dst)
+        return str(dst)
+
+    def _resolve(raw):
+        # Skip paths with shell expansions we can't safely resolve.
+        if "$" in raw or "`" in raw:
+            return None
+        candidates = []
+        p = Path(raw).expanduser()
+        if p.is_absolute():
+            candidates.append(p)
+        else:
+            candidates.append(Path(script_cwd) / p)
+            try:
+                candidates.append(Path(cached_script_path).parent / p)
+            except Exception:
+                pass
+        for c in candidates:
+            try:
+                if c.is_file():
+                    return c.resolve()
+            except OSError:
+                continue
+        return None
+
+    def _sub(m):
+        raw = m.group("path")
+        quote = m.group("quote") or ""
+        resolved = _resolve(raw)
+        if resolved is None:
+            return m.group(0)
+        return f"{quote}{_cache(resolved)}{quote}"
+
+    new_text = _YAML_TOKEN.sub(_sub, text)
+    if new_text != text:
+        Path(cached_script_path).write_text(new_text, encoding="utf-8")
+    return cached_paths, (str(cache_dir) if used else None)
 
 
 @contextmanager
@@ -144,12 +291,22 @@ def cmd_submit(argv):
         tid = next_id(tasks)
         cached = SCRIPTS_DIR / f"{tid}{script_path.suffix or '.sh'}"
         shutil.copy2(script_path, cached)
-        cmd = ["bash", str(cached), *extra]
+        new_extra, cached_yamls, cached_yaml_dir = snapshot_yamls(extra, tid)
+        # Also rewrite literal yaml paths embedded inside the (cached) script.
+        script_yamls, script_dir = snapshot_yamls_in_script(
+            cached, tid, script_cwd=os.getcwd()
+        )
+        if script_yamls:
+            cached_yamls = list(cached_yamls) + script_yamls
+            cached_yaml_dir = cached_yaml_dir or script_dir
+        cmd = ["bash", str(cached), *new_extra]
         tasks.append({
             "id": tid,
             "cmd": cmd,
             "script": str(script_path),
             "cached_script": str(cached),
+            "cached_yamls": cached_yamls,
+            "cached_yaml_dir": cached_yaml_dir,
             "desc": desc,
             "cwd": os.getcwd(),
             "status": "pending",
@@ -164,6 +321,8 @@ def cmd_submit(argv):
     msg = f"submitted task {tid}: {script_path}"
     if extra:
         msg += " " + " ".join(shlex.quote(c) for c in extra)
+    if cached_yamls:
+        msg += f"   [snapshotted {len(cached_yamls)} yaml]"
     if desc:
         msg += f"   # {desc}"
     print(msg)

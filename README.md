@@ -31,6 +31,7 @@ mytask eval.sh --ckpt last
 mytask show
 mytask log 2
 mytask kill 3
+mytask kill 3-11
 ```
 
 ## 行为

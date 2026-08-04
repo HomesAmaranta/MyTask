@@ -3,7 +3,13 @@
 
 Usage:
   mytask <script.sh> [args...] [-m "desc"]   submit a task (optional description)
-  mytask show [-d N|all]         list tasks (default: today; -d N: last N days)
+  mytask run <script.sh> [args...] [-m "desc"]  run NOW, bypassing the queue
+                                    (starts immediately in parallel with
+                                    whatever else is queued/running)
+  mytask show [-d N|all] [-D DATE] [-w]  list tasks (default: last 24h; -d N: last N*24h;
+                                    -D 260603 or YYYY-MM-DD: tasks started that day;
+                                    -w/--full: don't truncate DESC/CMD)
+  mytask info <id>               show full info of a task (untruncated)
   mytask log <id>                print task log
   mytask kill <id|a-b>           cancel/kill a task or an inclusive id range
   mytask clear                   remove finished tasks from list (keep logs)
@@ -49,26 +55,47 @@ def init():
         TASKS_FILE.write_text("[]")
 
 
+def _bucket_name(tid):
+    """Range-named bucket grouping every 1000 task ids: 0-999, 1000-1999, ..."""
+    lo = (tid // 1000) * 1000
+    return f"{lo}-{lo + 999}"
+
+
+def task_cache_dir(tid):
+    """Per-task cache dir holding the snapshotted sh + yaml + dataset copies."""
+    return SCRIPTS_DIR / _bucket_name(tid) / str(tid)
+
+
+def purge_dataset_modules(t):
+    """Delete the runtime dataset snapshot modules placed under the project's
+    data/ package. Called when a task reaches a terminal state so the working
+    copies don't pollute the training project. Archival copies in the task dir
+    are kept."""
+    for p in t.get("cached_dataset_modules") or []:
+        try:
+            Path(p).unlink()
+        except (FileNotFoundError, OSError):
+            pass
+
+
 def cleanup_cached_script(t):
+    """Best-effort full purge of a task's cached artifacts (dead code today;
+    kept in sync with the new layout). Removes the working dataset modules and
+    the whole per-task cache dir."""
+    purge_dataset_modules(t)
     p = t.get("cached_script")
-    if p:
+    tdir = Path(p).parent if p else None
+    for p in [t.get("cached_script"), *(t.get("cached_yamls") or []),
+              *(t.get("cached_datasets") or [])]:
+        if not p:
+            continue
         try:
             Path(p).unlink()
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             pass
-        except OSError:
-            pass
-    for p in t.get("cached_yamls") or []:
+    if tdir:
         try:
-            Path(p).unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
-    d = t.get("cached_yaml_dir")
-    if d:
-        try:
-            Path(d).rmdir()
+            tdir.rmdir()
         except OSError:
             pass
 
@@ -77,30 +104,29 @@ def _looks_like_yaml_path(s):
     return isinstance(s, str) and s.lower().endswith(YAML_EXTS)
 
 
-def snapshot_yamls(extra, tid):
-    """Replace yaml-looking paths in `extra` with copies under SCRIPTS_DIR/<tid>_yamls/.
+def snapshot_yamls(extra, dest_dir):
+    """Replace yaml-looking paths in `extra` with copies under `dest_dir`.
 
     Supports two forms:
       - bare path:           ".../foo.yaml"
       - key=path:            "--model_yaml=.../foo.yaml"
-    Returns (new_extra, cached_paths, cache_dir_or_None).
+    Returns (new_extra, cached_paths).
     Files that don't exist on disk are left untouched.
     """
     new_extra = list(extra)
     cached_paths = []
-    cache_dir = SCRIPTS_DIR / f"{tid}_yamls"
     used = False
 
     def _cache(src_path):
         nonlocal used
         if not used:
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            dest_dir.mkdir(parents=True, exist_ok=True)
             used = True
         # avoid name collisions across multiple yamls with same basename
-        dst = cache_dir / src_path.name
+        dst = dest_dir / src_path.name
         i = 1
         while dst.exists():
-            dst = cache_dir / f"{src_path.stem}_{i}{src_path.suffix}"
+            dst = dest_dir / f"{src_path.stem}_{i}{src_path.suffix}"
             i += 1
         shutil.copy2(src_path, dst)
         cached_paths.append(str(dst))
@@ -118,7 +144,7 @@ def snapshot_yamls(extra, tid):
                 p = Path(v).expanduser()
                 if p.is_file():
                     new_extra[i] = f"{k}={_cache(p.resolve())}"
-    return new_extra, cached_paths, (str(cache_dir) if used else None)
+    return new_extra, cached_paths
 
 
 # Match yaml/yml paths inside a shell script. We accept bare tokens, single-
@@ -131,9 +157,9 @@ _YAML_TOKEN = re.compile(
 )
 
 
-def snapshot_yamls_in_script(cached_script_path, tid, script_cwd):
+def snapshot_yamls_in_script(cached_script_path, script_cwd, dest_dir):
     """Scan a (cached) shell script, replace literal *.yaml/.yml paths with
-    snapshot copies under SCRIPTS_DIR/<tid>_yamls/.
+    snapshot copies under `dest_dir`.
 
     Resolution order for each match:
       1. as-is (absolute, or relative to caller's cwd)
@@ -142,10 +168,9 @@ def snapshot_yamls_in_script(cached_script_path, tid, script_cwd):
     Files that cannot be resolved are left untouched (assumed to be runtime-
     constructed paths, env vars, or user-provided args).
 
-    Mutates the cached script in place. Returns (cached_paths, cache_dir_or_None).
+    Mutates the cached script in place. Returns cached_paths.
     """
     text = Path(cached_script_path).read_text(encoding="utf-8", errors="replace")
-    cache_dir = SCRIPTS_DIR / f"{tid}_yamls"
     cached_paths = []
     used = False
     seen = {}  # original_resolved_path -> cached_path
@@ -156,12 +181,12 @@ def snapshot_yamls_in_script(cached_script_path, tid, script_cwd):
         if key in seen:
             return seen[key]
         if not used:
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            dest_dir.mkdir(parents=True, exist_ok=True)
             used = True
-        dst = cache_dir / src_path.name
+        dst = dest_dir / src_path.name
         i = 1
         while dst.exists():
-            dst = cache_dir / f"{src_path.stem}_{i}{src_path.suffix}"
+            dst = dest_dir / f"{src_path.stem}_{i}{src_path.suffix}"
             i += 1
         shutil.copy2(src_path, dst)
         cached_paths.append(str(dst))
@@ -201,7 +226,92 @@ def snapshot_yamls_in_script(cached_script_path, tid, script_cwd):
     new_text = _YAML_TOKEN.sub(_sub, text)
     if new_text != text:
         Path(cached_script_path).write_text(new_text, encoding="utf-8")
-    return cached_paths, (str(cache_dir) if used else None)
+    return cached_paths
+
+
+# Match `--dataset_version <name>` / `--dataset_version=<name>`. The value is a
+# bare python module name (letters, digits, underscore).
+_DATASET_TOKEN = re.compile(r"(--dataset_version[ \t=]+)([A-Za-z_]\w*)")
+_DATASET_NAME = re.compile(r"[A-Za-z_]\w*$")
+
+
+def _dataset_src(name, script_cwd):
+    """The training project resolves --dataset_version <name> via
+    importlib.import_module(f"data.{name}"), i.e. <cwd>/data/<name>.py."""
+    p = Path(script_cwd) / "data" / f"{name}.py"
+    return p if p.is_file() else None
+
+
+def _snapshot_one_dataset(name, tid, script_cwd, dest_dir, state):
+    """Freeze data/<name>.py for this task. Returns the (possibly rewritten)
+    module name to use. Memoized via `state` so the same name referenced in
+    both args and the script maps to one snapshot.
+
+    Creates two copies:
+      - working module  <cwd>/data/<name>__mt<tid>.py   (runtime-effective,
+        deleted when the task reaches a terminal state)
+      - archival copy   <dest_dir>/<name>.py            (kept as a record)
+    Names that can't be resolved on disk are left unchanged.
+    """
+    if name in state["seen"]:
+        return state["seen"][name]
+    src = _dataset_src(name, script_cwd)
+    if src is None:
+        state["seen"][name] = name
+        return name
+    src = src.resolve()
+    new_name = f"{name}__mt{tid}"
+    work = src.parent / f"{new_name}.py"
+    shutil.copy2(src, work)
+    state["modules"].append(str(work))
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    arch = dest_dir / f"{name}.py"
+    i = 1
+    while arch.exists():
+        arch = dest_dir / f"{name}_{i}.py"
+        i += 1
+    shutil.copy2(src, arch)
+    state["archives"].append(str(arch))
+    state["seen"][name] = new_name
+    return new_name
+
+
+def snapshot_dataset_in_args(extra, tid, script_cwd, dest_dir, state):
+    """Rewrite --dataset_version values in the extra CLI args to frozen copies."""
+    new_extra = list(extra)
+    i = 0
+    while i < len(new_extra):
+        a = new_extra[i]
+        if a == "--dataset_version" and i + 1 < len(new_extra):
+            nm = new_extra[i + 1]
+            if _DATASET_NAME.match(nm):
+                new_extra[i + 1] = _snapshot_one_dataset(
+                    nm, tid, script_cwd, dest_dir, state
+                )
+            i += 2
+            continue
+        if a.startswith("--dataset_version="):
+            nm = a.split("=", 1)[1]
+            if _DATASET_NAME.match(nm):
+                new_extra[i] = "--dataset_version=" + _snapshot_one_dataset(
+                    nm, tid, script_cwd, dest_dir, state
+                )
+        i += 1
+    return new_extra
+
+
+def snapshot_dataset_in_script(cached_script_path, tid, script_cwd, dest_dir, state):
+    """Rewrite --dataset_version values embedded in the (cached) script."""
+    text = Path(cached_script_path).read_text(encoding="utf-8", errors="replace")
+
+    def _sub(m):
+        return m.group(1) + _snapshot_one_dataset(
+            m.group(2), tid, script_cwd, dest_dir, state
+        )
+
+    new_text = _DATASET_TOKEN.sub(_sub, text)
+    if new_text != text:
+        Path(cached_script_path).write_text(new_text, encoding="utf-8")
 
 
 @contextmanager
@@ -251,8 +361,26 @@ def pid_alive(pid):
 
 # ---------- commands ----------
 
-def cmd_submit(argv):
-    # extract optional -m/--desc "description" from anywhere in argv
+def display_cmd(t):
+    """Command to show the user: original submitted script path, not the cached copy."""
+    dc = t.get("display_cmd")
+    if dc:
+        return dc
+    # Fallback for tasks submitted before display_cmd existed: swap the cached
+    # script (cmd[1]) back to the original script path; args kept as stored.
+    c = t.get("cmd")
+    if c and len(c) >= 2 and t.get("script"):
+        return [c[0], t["script"], *c[2:]]
+    return c or [t.get("script", "")]
+
+
+def _prepare_submission(argv, mode):
+    """Parse argv (script + args + optional -m/--desc), snapshot yaml/dataset
+    refs, and append a new task record with the given `mode` ("queued" for
+    the normal daemon-served queue, "immediate" for `mytask run`).
+
+    Returns (tid, task, script_path, extra, cached_yamls, ds_state).
+    """
     desc = ""
     rest = []
     i = 0
@@ -289,52 +417,112 @@ def cmd_submit(argv):
     with locked():
         tasks = load_tasks()
         tid = next_id(tasks)
-        cached = SCRIPTS_DIR / f"{tid}{script_path.suffix or '.sh'}"
+        cwd = os.getcwd()
+        tdir = task_cache_dir(tid)
+        tdir.mkdir(parents=True, exist_ok=True)
+        cached = tdir / f"{tid}{script_path.suffix or '.sh'}"
         shutil.copy2(script_path, cached)
-        new_extra, cached_yamls, cached_yaml_dir = snapshot_yamls(extra, tid)
+        new_extra, cached_yamls = snapshot_yamls(extra, tdir)
         # Also rewrite literal yaml paths embedded inside the (cached) script.
-        script_yamls, script_dir = snapshot_yamls_in_script(
-            cached, tid, script_cwd=os.getcwd()
-        )
+        script_yamls = snapshot_yamls_in_script(cached, script_cwd=cwd, dest_dir=tdir)
         if script_yamls:
             cached_yamls = list(cached_yamls) + script_yamls
-            cached_yaml_dir = cached_yaml_dir or script_dir
+        # Freeze the --dataset_version module (args + script) so later edits to
+        # data/<name>.py don't change a queued/running task.
+        ds_state = {"modules": [], "archives": [], "seen": {}}
+        new_extra = snapshot_dataset_in_args(new_extra, tid, cwd, tdir, ds_state)
+        snapshot_dataset_in_script(cached, tid, cwd, tdir, ds_state)
         cmd = ["bash", str(cached), *new_extra]
-        tasks.append({
+        task = {
             "id": tid,
             "cmd": cmd,
+            "display_cmd": ["bash", str(script_path), *extra],
             "script": str(script_path),
             "cached_script": str(cached),
             "cached_yamls": cached_yamls,
-            "cached_yaml_dir": cached_yaml_dir,
+            "cached_dataset_modules": ds_state["modules"],
+            "cached_datasets": ds_state["archives"],
             "desc": desc,
-            "cwd": os.getcwd(),
+            "cwd": cwd,
             "status": "pending",
+            "mode": mode,
             "submitted_at": now_iso(),
             "started_at": None,
             "finished_at": None,
             "exit_code": None,
             "pid": None,
             "log": str(day_dir / f"{tid}.log"),
-        })
+        }
+        tasks.append(task)
         save_tasks(tasks)
-    msg = f"submitted task {tid}: {script_path}"
+    return tid, task, script_path, extra, cached_yamls, ds_state
+
+
+def _submission_msg(verb, tid, script_path, extra, cached_yamls, ds_state, desc):
+    msg = f"{verb} task {tid}: {script_path}"
     if extra:
         msg += " " + " ".join(shlex.quote(c) for c in extra)
     if cached_yamls:
         msg += f"   [snapshotted {len(cached_yamls)} yaml]"
+    if ds_state["modules"]:
+        msg += f"   [snapshotted {len(ds_state['modules'])} dataset]"
     if desc:
         msg += f"   # {desc}"
-    print(msg)
+    return msg
+
+
+def cmd_submit(argv):
+    tid, task, script_path, extra, cached_yamls, ds_state = _prepare_submission(
+        argv, mode="queued"
+    )
+    print(_submission_msg("submitted", tid, script_path, extra, cached_yamls, ds_state, task["desc"]))
     ensure_daemon()
 
 
+def cmd_run(argv):
+    """Run a task right now, bypassing the daemon's serial queue: it starts
+    immediately and can execute in parallel with whatever the daemon is
+    already running."""
+    tid, task, script_path, extra, cached_yamls, ds_state = _prepare_submission(
+        argv, mode="immediate"
+    )
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--run-one", str(tid)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    print(_submission_msg("running", tid, script_path, extra, cached_yamls, ds_state, task["desc"])
+          + "   [bypassing queue]")
+
+
+def _parse_show_date(s):
+    """Parse a date filter: YYMMDD (260603), YYMMDD_HHMMSS (260603_085554),
+    YYYY-MM-DD, or YYYYMMDD. Only the date part is used."""
+    s = s.strip().split("_", 1)[0]   # drop optional _HHMMSS time suffix
+    for fmt in ("%y%m%d", "%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def cmd_show(argv):
-    # parse -d N (or -d all) — number of days to show, default 1 (today only)
+    # parse -d N (or -d all) — rolling window in days, default 1 (last 24h)
+    # parse -D <date> (YYMMDD / YYYY-MM-DD) — tasks that STARTED on that calendar day
     days = 1
+    on_date = None
+    full = False
     i = 0
     while i < len(argv):
         a = argv[i]
+        if a in ("-w", "--full"):
+            full = True
+            i += 1
+            continue
         if a == "-d" and i + 1 < len(argv):
             v = argv[i + 1]
             days = 0 if v == "all" else int(v)
@@ -345,6 +533,21 @@ def cmd_show(argv):
             days = 0 if v == "all" else int(v)
             i += 1
             continue
+        if a == "-D" and i + 1 < len(argv):
+            on_date = _parse_show_date(argv[i + 1])
+            if on_date is None:
+                print(f"mytask: invalid -D date '{argv[i+1]}' (use YYMMDD, YYMMDD_HHMMSS or YYYY-MM-DD)", file=sys.stderr)
+                sys.exit(1)
+            i += 2
+            continue
+        if a.startswith("-D="):
+            v = a[3:]
+            on_date = _parse_show_date(v)
+            if on_date is None:
+                print(f"mytask: invalid -D date '{v}' (use YYMMDD, YYMMDD_HHMMSS or YYYY-MM-DD)", file=sys.stderr)
+                sys.exit(1)
+            i += 1
+            continue
         i += 1
 
     tasks = load_tasks()
@@ -352,33 +555,52 @@ def cmd_show(argv):
         print("(no tasks)")
         return
 
-    # filter by submitted_at date
+    # -D <date>: show tasks that STARTED on that calendar day (overrides -d window)
+    if on_date is not None:
+        def started_on(t):
+            v = t.get("started_at")
+            if not v:
+                return False
+            try:
+                return datetime.fromisoformat(v).date() == on_date
+            except Exception:
+                return False
+        tasks = [t for t in tasks if started_on(t)]
+        daemon_status = "running" if daemon_alive() else "stopped"
+        print(f"daemon: {daemon_status}   showing: started on {on_date.isoformat()}   tasks: {len(tasks)}")
+        _print_task_table(tasks, full=full)
+        return
+
+    # filter by submitted_at, rolling window of `days`*24h from now
     if days > 0:
         from datetime import timedelta
-        cutoff = (datetime.now() - timedelta(days=days - 1)).date()
+        cutoff = datetime.now() - timedelta(days=days)
         def in_range(t):
-            # always show pending/running regardless of date
+            # always show pending/running regardless of time
             if t["status"] in ("pending", "running"):
                 return True
             try:
-                d = datetime.fromisoformat(t["submitted_at"]).date()
-                return d >= cutoff
+                return datetime.fromisoformat(t["submitted_at"]) >= cutoff
             except Exception:
                 return True
         tasks = [t for t in tasks if in_range(t)]
 
     daemon_status = "running" if daemon_alive() else "stopped"
-    print(f"daemon: {daemon_status}   showing: {'all' if days == 0 else f'last {days} day(s)'}   tasks: {len(tasks)}")
+    print(f"daemon: {daemon_status}   showing: {'all' if days == 0 else f'last {days}x24h'}   tasks: {len(tasks)}")
+    _print_task_table(tasks, full=full)
+
+
+def _print_task_table(tasks, full=False):
     if not tasks:
         return
     fmt = "{:>4}  {:<10}  {:<19}  {:<19}  {:>5}  {:<20}  {}"
     print(fmt.format("ID", "STATUS", "STARTED", "FINISHED", "EXIT", "DESC", "CMD"))
     for t in tasks:
-        cmd = " ".join(shlex.quote(c) for c in t.get("cmd") or [t.get("script", "")])
-        if len(cmd) > 60:
+        cmd = " ".join(shlex.quote(c) for c in display_cmd(t))
+        if not full and len(cmd) > 60:
             cmd = cmd[:57] + "..."
         desc = t.get("desc") or "-"
-        if len(desc) > 20:
+        if not full and len(desc) > 20:
             desc = desc[:17] + "..."
         print(fmt.format(
             t["id"],
@@ -389,6 +611,30 @@ def cmd_show(argv):
             desc,
             cmd,
         ))
+
+
+def cmd_info(argv):
+    if not argv:
+        print("mytask: info requires a task id", file=sys.stderr)
+        sys.exit(1)
+    tid = int(argv[0])
+    tasks = load_tasks()
+    t = next((x for x in tasks if x["id"] == tid), None)
+    if not t:
+        print(f"mytask: no task with id {tid}", file=sys.stderr)
+        sys.exit(1)
+    cmd = " ".join(shlex.quote(c) for c in display_cmd(t))
+    fmt = "{:>4}  {:<10}  {:<19}  {:<19}  {:>5}  {:<20}  {}"
+    print(fmt.format("ID", "STATUS", "STARTED", "FINISHED", "EXIT", "DESC", "CMD"))
+    print(fmt.format(
+        t["id"],
+        t["status"],
+        (t["started_at"] or "-")[:19],
+        (t["finished_at"] or "-")[:19],
+        "-" if t["exit_code"] is None else str(t["exit_code"]),
+        t.get("desc") or "-",
+        cmd,
+    ))
 
 
 def cmd_log(argv):
@@ -440,7 +686,7 @@ def cmd_kill(argv):
             if t["status"] == "pending":
                 t["status"] = "cancelled"
                 t["finished_at"] = now_iso()
-                cleanup_cached_script(t)
+                purge_dataset_modules(t)
                 changed = True
                 print(f"task {tid}: cancelled (was pending)")
                 continue
@@ -485,6 +731,76 @@ def cmd_stop_daemon(_argv):
         return
     os.kill(pid, signal.SIGTERM)
     print(f"sent SIGTERM to daemon (pid {pid})")
+
+
+def run_one(tid):
+    """Run a single 'immediate' task to completion in this process, updating
+    tasks.json as it starts/finishes. Launched detached by `mytask run` so it
+    survives the parent CLI invocation returning; runs independently of the
+    daemon's serial loop, hence can overlap with a queued task."""
+    init()
+    tasks = load_tasks()
+    t = next((x for x in tasks if x["id"] == tid), None)
+    if t is None:
+        return
+
+    log_path = Path(t["log"])
+    log_f = open(log_path, "w")
+    log_f.write(f"=== task {t['id']} (immediate) ===\n")
+    if t.get("desc"):
+        log_f.write(f"desc: {t['desc']}\n")
+    log_f.write(f"cmd: {' '.join(shlex.quote(c) for c in t['cmd'])}\n")
+    log_f.write(f"cwd: {t['cwd']}\n")
+    log_f.write(f"submitted: {t['submitted_at']}\n")
+    log_f.write(f"started:   {now_iso()}\n")
+    log_f.write("=== output ===\n")
+    log_f.flush()
+
+    try:
+        proc = subprocess.Popen(
+            t["cmd"],
+            cwd=t["cwd"] if os.path.isdir(t["cwd"]) else None,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        log_f.write(f"\n=== failed to start: {e} ===\n")
+        log_f.close()
+        with locked():
+            tasks = load_tasks()
+            for x in tasks:
+                if x["id"] == tid:
+                    x["status"] = "failed"
+                    x["finished_at"] = now_iso()
+                    x["exit_code"] = -1
+                    purge_dataset_modules(x)
+            save_tasks(tasks)
+        return
+
+    with locked():
+        tasks = load_tasks()
+        for x in tasks:
+            if x["id"] == tid:
+                x["status"] = "running"
+                x["pid"] = proc.pid
+                x["started_at"] = now_iso()
+        save_tasks(tasks)
+
+    ret = proc.wait()
+    log_f.write(f"\n=== finished: {now_iso()} exit={ret} ===\n")
+    log_f.close()
+    with locked():
+        tasks = load_tasks()
+        for x in tasks:
+            if x["id"] == tid:
+                if x["status"] == "running":
+                    x["status"] = "done" if ret == 0 else "failed"
+                x["exit_code"] = ret
+                x["finished_at"] = now_iso()
+                purge_dataset_modules(x)
+        save_tasks(tasks)
 
 
 # ---------- daemon ----------
@@ -546,6 +862,8 @@ def run_daemon():
         tasks = load_tasks()
         changed = False
         for t in tasks:
+            if t["status"] == "running" and t.get("mode") == "immediate":
+                continue  # supervised by its own `run_one` process, not us
             if t["status"] == "running":
                 if pid_alive(t.get("pid") or 0):
                     # somehow still running; leave it but we lost the handle
@@ -556,10 +874,14 @@ def run_daemon():
                     t["status"] = "failed"
                     t["finished_at"] = now_iso()
                     t["exit_code"] = t["exit_code"] if t["exit_code"] is not None else -1
-                    cleanup_cached_script(t)
                 changed = True
         if changed:
             save_tasks(tasks)
+        # Sweep leaked dataset snapshot modules from crashed runs: any task not
+        # pending/running no longer needs its working copies under data/.
+        for t in tasks:
+            if t["status"] not in ("pending", "running"):
+                purge_dataset_modules(t)
 
     current = None  # dict: {id, proc, log_f}
     last_active = time.time()
@@ -584,7 +906,7 @@ def run_daemon():
                                     t["status"] = "done" if ret == 0 else "failed"
                                 t["exit_code"] = ret
                                 t["finished_at"] = now_iso()
-                                cleanup_cached_script(t)
+                                purge_dataset_modules(t)
                         save_tasks(tasks)
                     print(f"[{now_iso()}] task {current['id']} finished exit={ret}", flush=True)
                     current = None
@@ -628,6 +950,7 @@ def run_daemon():
                                     t["status"] = "failed"
                                     t["finished_at"] = now_iso()
                                     t["exit_code"] = -1
+                                    purge_dataset_modules(t)
                             save_tasks(tasks)
                             next_task = None
                         else:
@@ -688,11 +1011,17 @@ def main():
     if cmd == "--daemon":
         run_daemon()
         return
+    if cmd == "--run-one":
+        run_one(int(rest[0]))
+        return
     if cmd in ("-h", "--help", "help"):
         print(USAGE)
         return
     if cmd == "show":
         cmd_show(rest)
+        return
+    if cmd == "info":
+        cmd_info(rest)
         return
     if cmd == "log":
         cmd_log(rest)
@@ -705,6 +1034,9 @@ def main():
         return
     if cmd == "stop-daemon":
         cmd_stop_daemon(rest)
+        return
+    if cmd == "run":
+        cmd_run(rest)
         return
 
     # default: submit

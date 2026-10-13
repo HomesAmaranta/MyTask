@@ -18,7 +18,7 @@ Usage:
   mytask on ID[,ID]...           re-enable disabled workers
   mytask trust-workers [off|ID...] show/set workers allowed when probe fails
   mytask worker-ssh [ID TARGET|off ID] show/set SSH launch target for a worker
-  mytask gpus [--detail] [ID...] list GPUs by worker
+  mytask gpus [--detail] [local|ID...] list local and worker GPUs
   mytask gpu-tasks [ID...]       list running task ids by GPU
   mytask gpu-policy [UTIL FREE]  show/set idle GPU thresholds
   mytask clear                   remove finished tasks from list (keep logs)
@@ -666,6 +666,22 @@ def _parse_probe_output(worker_id, stdout, returncode, source):
         result["ok"] = False
         result["error"] = result.get("error") or f"{source} exit={returncode}"
     return result
+
+
+def probe_local_gpu():
+    """Probe CUDA devices visible to the current Python environment."""
+    try:
+        out = subprocess.run(
+            [sys.executable, "-c", GPU_PROBE_CODE],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+        )
+    except Exception as exc:
+        return {"worker_id": "local", "ok": False, "error": str(exc)}
+    return _parse_probe_output("local", out.stdout, out.returncode, "local")
 
 
 def probe_worker_gpu_ssh(worker_id, ssh_target):
@@ -1481,21 +1497,21 @@ def cmd_gpus(argv):
             detail = True
         else:
             workers_arg.append(arg)
-    inventory = worker_inventory()
-    workers = workers_arg or list(inventory.keys())
-    if not workers:
-        print("mytask: no workers found; try `mytask workers auto` after workers are launched", file=sys.stderr)
-        sys.exit(1)
+    inventory = {} if workers_arg == ["local"] else worker_inventory()
+    workers = workers_arg or ["local", *inventory.keys()]
     print("{:<12}  {}".format("WORKER", "GPU"))
-    if not detail:
-        for worker_id, gpu_index, gpu in iter_worker_gpu_rows(workers, inventory=inventory):
-            gpu_type = gpu.get("gpu_name") or gpu.get("gpu_type") or "-"
-            print("{:<12}  {}".format(str(worker_id), f"index={gpu_index} type={gpu_type}"))
-        return
     for worker_id in workers:
         worker_id = str(worker_id)
-        info = probe_worker_gpu(worker_id, load_config())
+        if worker_id != "local" and not detail:
+            for _, gpu_index, gpu in iter_worker_gpu_rows([worker_id], inventory=inventory):
+                gpu_type = gpu.get("gpu_name") or gpu.get("gpu_type") or "-"
+                print("{:<12}  {}".format(worker_id, f"index={gpu_index} type={gpu_type}"))
+            continue
+        info = probe_local_gpu() if worker_id == "local" else probe_worker_gpu(worker_id, load_config())
         if not info.get("ok"):
+            if worker_id == "local":
+                print("{:<12}  {}".format("local", f"ERROR {info.get('error') or 'no visible CUDA GPUs'}"))
+                continue
             trusted_info = trusted_worker_gpu_info(worker_id, load_config(), inventory=inventory)
             if trusted_info:
                 for gpu in trusted_info.get("gpus") or []:
@@ -1520,6 +1536,9 @@ def cmd_gpus(argv):
                 print("{:<12}  {}".format(worker_id, f"ERROR {err}"))
             continue
         for gpu in info.get("gpus") or []:
+            if not detail:
+                print("{:<12}  {}".format(worker_id, f"index={gpu.get('gpu_index')} type={gpu.get('gpu_name') or '-'}"))
+                continue
             free_pct = gpu_free_percent(gpu)
             free_s = "-" if free_pct is None else f"{free_pct:.1f}%"
             util = gpu.get("gpu_util")

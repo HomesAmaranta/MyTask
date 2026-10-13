@@ -23,7 +23,7 @@ ln -s /Path/to/MyTask/mytask ~/miniconda3/envs/test_npm/bin/mytask
 | `mytask parallel [N]` | 查看或设置并发数；本地模式为总并发，worker 模式为每张 GPU 的并发 |
 | `mytask workers [off\|auto\|ID...]` | 查看、关闭、自动发现或指定 GPU worker 派发 |
 | `mytask trust-workers [off\|ID...]` | 标记可信 worker；深度探测失败时仍允许按 `worker list` 派发 |
-| `mytask gpus [--detail] [ID...]` | 查询当前 worker GPU；默认快速模式只读 `worker list`，`--detail` 用 `torch.cuda` 查显存 |
+| `mytask gpus [--detail] [local\|ID...]` | 默认查询本地和 worker GPU；`local` 只查本机，`--detail` 显示显存信息 |
 | `mytask gpu-tasks [ID...]` | 查询每张 GPU 的型号和当前 running 的任务号 |
 | `mytask gpu-policy [UTIL FREE]` | 查看或设置空闲 GPU 阈值，默认 `util<30 free>70%` |
 | `mytask clear` | 清掉已完成的任务记录（日志文件保留） |
@@ -41,12 +41,17 @@ mytask kill 3-11
 mytask workers 1061707 1061703
 mytask trust-workers 1064182
 mytask gpus
+mytask gpus local
+mytask gpus --detail local
 mytask gpus --detail
 mytask gpu-tasks
 mytask gpu-policy 30 70
 ```
 
 ## 行为
+
+- **本地 GPU 查询**：`mytask gpus` 默认包含 `local` 行；本机用运行 mytask 的 Python 环境中的 `torch.cuda` 探测，需要该环境安装 PyTorch。遵循 `CUDA_VISIBLE_DEVICES`，显示的是进程可见设备及其逻辑编号；`--detail` 显示空闲显存比例，利用率暂为 `unknown`。无 CUDA、缺少 PyTorch 或探测失败会显示错误，不影响远程结果。`mytask gpus local` 不连接远程；显式指定 worker ID 时只查询指定 worker。远程默认仍只读取 `worker list`，详细模式才深度探测。
+- **查询不等于调度**：本地 GPU 展示不会启用本地自动分卡，`gpu-tasks` 仍只展示 worker 任务映射。
 
 - **并发控制**：`mytask parallel N` 控制 queued 任务并发数，默认 1；本地模式下表示总并发，worker 派发模式下表示每张 worker GPU 的并发数。
 - **后台执行**：每个任务在独立进程组里运行，方便整组 kill。
